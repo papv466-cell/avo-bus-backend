@@ -16,8 +16,10 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
 const PORT = process.env.PORT || 3000;
-const path = require("path");
-app.use(require("express").static(path.join(__dirname, "..")));
+const path = require('path');
+
+// ─── Archivos estáticos ───────────────────────────────────────────────────────
+app.use(require('express').static(path.join(__dirname, '..')));
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors());
@@ -52,8 +54,8 @@ app.get('/lines/:lineId', (req, res) => {
   const line = getLines().find(l => l.lineId === req.params.lineId);
   if (!line) return res.status(404).json({ error: 'Línea no encontrada' });
 
-  const route = getLineRoute();
-  const stops = getLineStops();
+  const route = getLineRoute(req.params.lineId);
+  const stops = getLineStops(req.params.lineId);
 
   // Usar recorrido real si está disponible, si no usar paradas
   const routeCoords = route.length > 0 ? route : stops;
@@ -102,9 +104,12 @@ app.get('/vehicles/:lineId', (req, res) => {
   res.json(vehicle);
 });
 
-// GET /stops/m135 — Paradas de la línea M135
-app.get('/stops/m135', (req, res) => {
-  res.json({ lineId: 'M135', stops: STOPS_M135 });
+// GET /stops/:lineId — Paradas de una línea
+app.get('/stops/:lineId', (req, res) => {
+  const lineId = req.params.lineId.toUpperCase();
+  const stops = getLineStops(lineId);
+  if (!stops.length) return res.status(404).json({ error: 'Sin paradas' });
+  res.json(stops);
 });
 
 // GET /stops/:lineId/:stopIndex/eta — ETA del bus a una parada específica
@@ -177,7 +182,7 @@ setInterval(() => {
 }, 30000);
 
 // ─── Arrancar ─────────────────────────────────────────────────────────────────
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, () => {
   console.log(`\n🚌 AVO Backend MVP corriendo en http://localhost:${PORT}`);
   console.log(`📡 WebSocket en ws://localhost:${PORT}/ws`);
   console.log(`📋 Endpoints:`);
