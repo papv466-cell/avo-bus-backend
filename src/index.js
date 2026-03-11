@@ -177,7 +177,7 @@ setInterval(() => {
 }, 30000);
 
 // ─── Arrancar ─────────────────────────────────────────────────────────────────
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚌 AVO Backend MVP corriendo en http://localhost:${PORT}`);
   console.log(`📡 WebSocket en ws://localhost:${PORT}/ws`);
   console.log(`📋 Endpoints:`);
