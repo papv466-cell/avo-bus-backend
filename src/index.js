@@ -1,63 +1,51 @@
-// ─── AVO MVP Backend ──────────────────────────────────────────────────────────
-// Express REST API + WebSocket para tiempo real
-// Arranca con: node src/index.js
+// ─── AVO Bus Backend — index.js ───────────────────────────────────────────────
+const express    = require('express');
+const http       = require('http');
+const WebSocket  = require('ws');
+const cors       = require('cors');
+const {
+  startPolling,
+  addListener,
+  removeListener,
+  getVehicleState,
+  getLineStops,
+  getLineRoute,
+  getLines,
+  getLine,
+  extrapolatePosition,
+} = require('./poller');
 
-require('dotenv').config();
-const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
-const cors = require('cors');
-
-const { startPolling, addListener, removeListener, getVehicleState, getLines, getLineStops, getLineRoute } = require('./poller');
-const { STOPS_M135 } = require('./stops');
-
-const app = express();
+const app    = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: '/ws' });
+const wss    = new WebSocket.Server({ server });
 
-const PORT = process.env.PORT || 3000;
-const path = require('path');
-
-// ─── Archivos estáticos ───────────────────────────────────────────────────────
-app.use(require('express').static(path.join(__dirname, '..')));
-
-// ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// Log básico de requests
-app.use((req, res, next) => {
-  console.log(`${req.method} ${req.path}`);
-  next();
-});
-
-// ─── REST API ─────────────────────────────────────────────────────────────────
-
-// Health check
+// ── GET /health ────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', ts: new Date().toISOString() });
 });
 
-// GET /lines — Lista de líneas disponibles
+// ── GET /lines ─────────────────────────────────────────────────────────────────
 app.get('/lines', (req, res) => {
   const lines = getLines().map(l => ({
-    lineId: l.lineId,
-    name: l.name,
-    color: l.color,
+    lineId:     l.lineId,
+    name:       l.name,
+    color:      l.color,
     stopsCount: l.stops.length,
   }));
   res.json({ lines });
 });
 
-// GET /lines/:lineId — Detalle de una línea con paradas, recorrido y shape
+// ── GET /lines/:lineId — Detalle con paradas + recorrido real (shape) ──────────
 app.get('/lines/:lineId', (req, res) => {
-  const line = getLines().find(l => l.lineId === req.params.lineId);
+  const lid  = req.params.lineId.toUpperCase();
+  const line = getLines().find(l => l.lineId === lid);
   if (!line) return res.status(404).json({ error: 'Línea no encontrada' });
 
-  const route = getLineRoute(req.params.lineId);
-  const stops = getLineStops(req.params.lineId);
-
-  // Usar recorrido real si está disponible, si no usar paradas
+  const route = getLineRoute(lid);
+  const stops = getLineStops(lid);
   const routeCoords = route.length > 0 ? route : stops;
 
   res.json({
@@ -77,124 +65,69 @@ app.get('/lines/:lineId', (req, res) => {
   });
 });
 
-// GET /vehicles — Posiciones actuales de todos los vehículos
+// ── GET /vehicles — Posiciones de todos los vehículos ─────────────────────────
 app.get('/vehicles', (req, res) => {
   const state = getVehicleState();
   const vehicles = Object.values(state).map(v => ({
-    lineId: v.lineId,
-    lineName: v.lineName,
+    lineId:    v.lineId,
+    lineName:  v.lineName,
     lineColor: v.lineColor,
-    lat: v.lat,
-    lon: v.lon,
-    speedKmh: v.speedKmh,
+    lat:       v.lat,
+    lon:       v.lon,
+    speedKmh:  v.speedKmh,
     vehicleId: v.vehicleId,
     updatedAt: v.updatedAt,
-    isOnline: v.isOnline,
+    isOnline:  v.isOnline,
   }));
   res.json({ vehicles });
 });
 
-// GET /vehicles/:lineId — Posición de un vehículo específico con ETAs completas
+// ── GET /vehicles/:lineId — Vehículo con ETAs y dead-reckoning ────────────────
+// Dead-reckoning: si el GPS del bus lleva N segundos sin actualizar,
+// extrapolamos la posición usando velocidad + dirección hacia siguiente parada.
+// Esto elimina el lag visual en el mapa (icono 3 min por detrás del bus real).
 app.get('/vehicles/:lineId', (req, res) => {
-  const state = getVehicleState();
-  const vehicle = state[req.params.lineId];
+  const lid     = req.params.lineId.toUpperCase();
+  const state   = getVehicleState();
+  const vehicle = state[lid];
   if (!vehicle) {
     return res.status(404).json({ error: 'Vehículo no disponible', isOnline: false });
   }
-  res.json(vehicle);
+
+  // Aplicar dead-reckoning si el GPS está desactualizado
+  const extrapolated = typeof extrapolatePosition === 'function'
+    ? extrapolatePosition(vehicle, getLineStops(lid))
+    : vehicle;
+
+  res.json(extrapolated);
 });
 
-// GET /stops/:lineId — Paradas de una línea
+// ── GET /stops/:lineId — Paradas de una línea ─────────────────────────────────
 app.get('/stops/:lineId', (req, res) => {
-  const lineId = req.params.lineId.toUpperCase();
-  const stops = getLineStops(lineId);
-  if (!stops.length) return res.status(404).json({ error: 'Sin paradas' });
-  res.json(stops);
+  const lid   = req.params.lineId.toUpperCase();
+  const stops = getLineStops(lid);
+  if (!stops.length) return res.status(404).json({ error: 'Línea no encontrada' });
+  res.json({ lineId: lid, stops });
 });
 
-// GET /stops/:lineId/:stopIndex/eta — ETA del bus a una parada específica
-app.get('/stops/:lineId/:stopIndex/eta', (req, res) => {
+// ── WebSocket — push en tiempo real ───────────────────────────────────────────
+wss.on('connection', (ws) => {
+  const cb = (msg) => { if (ws.readyState === WebSocket.OPEN) ws.send(msg); };
+  addListener(cb);
+
+  // Enviar estado actual de todos los vehículos al conectar
   const state = getVehicleState();
-  const vehicle = state[req.params.lineId];
-  const stopIndex = parseInt(req.params.stopIndex);
+  Object.values(state).forEach(v => {
+    if (v.isOnline) ws.send(JSON.stringify({ type: 'vehicle:position', data: v }));
+  });
 
-  if (!vehicle || !vehicle.isOnline) {
-    return res.json({
-      status: 'offline',
-      message: 'Bus no disponible en tiempo real',
-      etaMinutes: null,
-      etaSeconds: null,
-    });
-  }
-
-  const eta = vehicle.etas?.[stopIndex];
-  if (!eta) return res.status(404).json({ error: 'Parada no encontrada' });
-
-  res.json(eta);
+  ws.on('close', () => removeListener(cb));
+  ws.on('error', () => removeListener(cb));
 });
 
-// ─── WebSocket ────────────────────────────────────────────────────────────────
-wss.on('connection', (ws, req) => {
-  console.log(`🔌 Cliente WS conectado. Total: ${wss.clients.size}`);
-
-  // Enviar estado actual al conectarse
-  const state = getVehicleState();
-  ws.send(JSON.stringify({
-    type: 'init',
-    data: Object.values(state),
-    timestamp: new Date().toISOString(),
-  }));
-
-  // Suscribir al listener del poller
-  const listener = (json) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(json);
-    }
-  };
-  addListener(listener);
-
-  ws.on('message', (msg) => {
-    try {
-      const parsed = JSON.parse(msg);
-      // El cliente puede suscribirse a una línea específica (por ahora ignoramos, mandamos todo)
-      console.log('WS message from client:', parsed);
-    } catch (e) { /* ignorar mensajes malformados */ }
-  });
-
-  ws.on('close', () => {
-    removeListener(listener);
-    console.log(`🔌 Cliente WS desconectado. Total: ${wss.clients.size}`);
-  });
-
-  ws.on('error', (err) => {
-    console.error('WS error:', err.message);
-    removeListener(listener);
-  });
-});
-
-// ─── Ping/Pong para mantener conexiones vivas ─────────────────────────────────
-setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.ping();
-    }
-  });
-}, 30000);
-
-// ─── Arrancar ─────────────────────────────────────────────────────────────────
+// ── Start ──────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`\n🚌 AVO Backend MVP corriendo en http://localhost:${PORT}`);
-  console.log(`📡 WebSocket en ws://localhost:${PORT}/ws`);
-  console.log(`📋 Endpoints:`);
-  console.log(`   GET /health`);
-  console.log(`   GET /lines`);
-  console.log(`   GET /lines/:lineId`);
-  console.log(`   GET /vehicles`);
-  console.log(`   GET /vehicles/:lineId`);
-  console.log(`   GET /stops/m135`);
-  console.log(`   GET /stops/:lineId/:stopIndex/eta\n`);
-
+  console.log(`🚌 AVO Backend escuchando en puerto ${PORT}`);
   startPolling();
 });
-
-module.exports = { app, server };
