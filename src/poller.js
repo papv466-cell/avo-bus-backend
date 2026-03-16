@@ -1,103 +1,90 @@
-// ─── Tracking Poller v3 — Multi-línea ────────────────────────────────────────
-// Usa RUTAS_GET para obtener todos los servicios de cada línea
-// No necesita escaneo de rangos — los COD_SERV_REITERACION son fijos
+// ─── AVO Tracking Poller v5 ────────────────────────────────────────────────────
+// NOVEDAD: trackea IDA y VUELTA simultáneamente por línea
+// Cada línea puede tener hasta 2 buses activos al mismo tiempo
 
-const fetch = require('node-fetch');
+const fetch  = require('node-fetch');
 const { calculateETAs } = require('./eta');
 
 const BASE_URL = process.env.TRACKING_BASE_URL || 'https://www.virtual-office365.com/app/locrutas/v2/api/api.php';
 const COMPANY  = process.env.TRACKING_COMPANY  || 'VAZQUEZOLMEDO';
 const POLL_MS  = parseInt(process.env.TRACKING_POLL_INTERVAL_MS || '5000');
 
-// ─── Definición de líneas públicas ────────────────────────────────────────────
+// ─── Definición de líneas ──────────────────────────────────────────────────────
 const LINE_DEFS = [
-  {
-    lineId:     'M135',
-    name:       'M-135 · Alhaurín de la Torre — Málaga',
-    shortName:  'M135',
-    color:      '#00C8E8',
-    codEnruta:  4,
-    // Usamos el primer COD_SERV_RUTA de dirección Málaga como referencia para paradas/recorrido
-    codServRuta: 200020,
-  },
-  {
-    lineId:     'M143',
-    name:       'M-143 · Alhaurín de la Torre — Teatinos',
-    shortName:  'M143',
-    color:      '#FFB830',
-    codEnruta:  7,
-    codServRuta: 200065,
-  },
-  {
-    lineId:     'M170',
-    name:       'M-170 · Pinos de Alhaurín — Málaga (Express)',
-    shortName:  'M170',
-    color:      '#00E8A0',
-    codEnruta:  9,
-    codServRuta: 500586,
-  },
-  {
-    lineId:     'MUMFI',
-    name:       'MUMFI · Alhaurín de la Torre — Alquería',
-    shortName:  'MUMFI',
-    color:      '#A78BFA',
-    codEnruta:  8,
-    codServRuta: 500584,
-  },
+  { lineId:'M135',  name:'M-135 · Alhaurín de la Torre — Málaga',        color:'#00C8E8', codEnruta:4, codServRuta:200020 },
+  { lineId:'M143',  name:'M-143 · Alhaurín de la Torre — Teatinos',      color:'#FFB830', codEnruta:7, codServRuta:200065 },
+  { lineId:'M170',  name:'M-170 · Pinos de Alhaurín — Málaga (Express)', color:'#00E8A0', codEnruta:9, codServRuta:500586 },
+  { lineId:'MUMFI', name:'MUMFI · Alhaurín de la Torre — Alquería',      color:'#A78BFA', codEnruta:8, codServRuta:500584 },
 ];
 
-// ─── Estado global ────────────────────────────────────────────────────────────
-// Por línea: { stops, route, services, activeService, vehicleState, kalman, history }
+// ─── Estado por línea ──────────────────────────────────────────────────────────
+// vehicles: { ida: vehicleObj|null, vuelta: vehicleObj|null }
 const lineStates = {};
 LINE_DEFS.forEach(l => {
   lineStates[l.lineId] = {
-    def:           l,
-    stops:         [],
-    route:         [],
-    services:      [],   // array de { COD_SERV_REITERACION, HORA_SALIDA, DESCRIPCION, ... }
-    activeService: null, // el que tiene bus activo ahora
-    vehicle:       null, // posición actual
-    kalman:        {},
-    history:       {},
+    def:      l,
+    stops:    [],
+    route:    [],
+    services: [],
+    vehicles: { ida: null, vuelta: null },  // DOS buses
+    active:   { ida: null, vuelta: null },  // servicios activos
+    kalman:   { ida: {}, vuelta: {} },
+    history:  { ida: {}, vuelta: {} },
   };
 });
 
 const listeners = new Set();
 
-// ─── Helpers HTTP ─────────────────────────────────────────────────────────────
+// ─── HTTP ──────────────────────────────────────────────────────────────────────
 async function apiFetch(params) {
-  const qs = Object.entries({ COMPANY, USER: '', PASS: '', ...params })
-    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
-  const url = `${BASE_URL}?${qs}&_=${Date.now()}`;
-  const res = await fetch(url, { timeout: 8000 });
+  const qs = Object.entries({ COMPANY, USER:'', PASS:'', ...params })
+    .map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+  const res = await fetch(`${BASE_URL}?${qs}&_=${Date.now()}`, { timeout: 8000 });
   return res.json();
 }
 
-// ─── Cargar servicios de una línea (RUTAS_GET) ────────────────────────────────
+// ─── Dirección desde DESCRIPCION ──────────────────────────────────────────────
+function parseDirection(descripcion, color) {
+  const d = descripcion || '';
+  if (/Santa Amalia.*Málaga|Alhaurín.*Málaga|Torre.*Málaga/i.test(d))
+    return { dir:'ida',    label:'→ Málaga',               short:'ida' };
+  if (/Málaga.*Santa Amalia|Málaga.*Alhaurín|Málaga.*Torre/i.test(d))
+    return { dir:'vuelta', label:'→ Alhaurín de la Torre', short:'vuelta' };
+  const c = (color||'').toUpperCase();
+  if (c === '#8A9747') return { dir:'ida',    label:'→ Málaga',               short:'ida' };
+  if (c === '#2DA701') return { dir:'vuelta', label:'→ Alhaurín de la Torre', short:'vuelta' };
+  return { dir:'unknown', label:'', short:'' };
+}
+
+// ─── Cargar servicios ──────────────────────────────────────────────────────────
 async function loadServices(lineId) {
   const st = lineStates[lineId];
   try {
-    const data = await apiFetch({ OP: 'RUTAS_GET', COD_ENRUTA: st.def.codEnruta });
+    const data = await apiFetch({ OP:'RUTAS_GET', COD_ENRUTA:st.def.codEnruta });
     if (data.estado !== 'ok' || !data.resultados?.length) throw new Error('Sin servicios');
     st.services = data.resultados.map(r => ({
-      cod:         r.COD_SERV_REITERACION,
-      codRuta:     r.COD_SERV_RUTA,
-      hora:        r.HORA_SALIDA,
-      descripcion: r.DESCRIPCION,
-      lunes:       r.LUNES, martes: r.MARTES, miercoles: r.MIERCOLES,
-      jueves:      r.JUEVES, viernes: r.VIERNES, sabado: r.SABADO, domingo: r.DOMINGO,
+      cod:       r.COD_SERV_REITERACION,
+      codRuta:   r.COD_SERV_RUTA,
+      hora:      r.HORA_SALIDA,
+      desc:      r.DESCRIPCION,
+      color:     r.COLOR,
+      direction: parseDirection(r.DESCRIPCION, r.COLOR),
+      lunes:r.LUNES, martes:r.MARTES, miercoles:r.MIERCOLES,
+      jueves:r.JUEVES, viernes:r.VIERNES, sabado:r.SABADO, domingo:r.DOMINGO,
     }));
-    console.log(`[${lineId}] ✅ ${st.services.length} servicios cargados`);
-  } catch (e) {
-    console.warn(`[${lineId}] ⚠️  Error cargando servicios: ${e.message}`);
+    const ida    = st.services.filter(s => s.direction.dir === 'ida').length;
+    const vuelta = st.services.filter(s => s.direction.dir === 'vuelta').length;
+    console.log(`[${lineId}] ✅ ${st.services.length} servicios (${ida} ida, ${vuelta} vuelta)`);
+  } catch(e) {
+    console.warn(`[${lineId}] ⚠️  servicios: ${e.message}`);
   }
 }
 
-// ─── Cargar paradas ───────────────────────────────────────────────────────────
+// ─── Cargar paradas y recorrido ────────────────────────────────────────────────
 async function loadStops(lineId) {
   const st = lineStates[lineId];
   try {
-    const data = await apiFetch({ OP: 'RUTA_PARADAS_GET', COD_ENRUTA: st.def.codEnruta, COD_SERV_RUTA: st.def.codServRuta });
+    const data = await apiFetch({ OP:'RUTA_PARADAS_GET', COD_ENRUTA:st.def.codEnruta, COD_SERV_RUTA:st.def.codServRuta });
     if (data.estado !== 'ok' || !data.resultados?.length) throw new Error('Sin paradas');
     st.stops = data.resultados.map(p => ({
       orden:  p.NUM_PARADA,
@@ -106,266 +93,229 @@ async function loadStops(lineId) {
       lon:    parseFloat(p.COOR_Y),
       hora:   p.HORA_PARADA,
     }));
-    console.log(`[${lineId}] ✅ ${st.stops.length} paradas cargadas`);
-  } catch (e) {
-    console.warn(`[${lineId}] ⚠️  Sin paradas: ${e.message}`);
-  }
+    console.log(`[${lineId}] ✅ ${st.stops.length} paradas`);
+  } catch(e) { console.warn(`[${lineId}] ⚠️  paradas: ${e.message}`); }
 }
 
-// ─── Cargar recorrido ─────────────────────────────────────────────────────────
 async function loadRoute(lineId) {
   const st = lineStates[lineId];
   try {
-    const data = await apiFetch({ OP: 'RUTA_RECORRIDO_GET', COD_ENRUTA: st.def.codEnruta, COD_SERV_RUTA: st.def.codServRuta });
+    const data = await apiFetch({ OP:'RUTA_RECORRIDO_GET', COD_ENRUTA:st.def.codEnruta, COD_SERV_RUTA:st.def.codServRuta });
     if (data.estado !== 'ok' || !data.resultados?.length) throw new Error('Sin recorrido');
-    st.route = data.resultados.map(p => ({ lat: parseFloat(p.LAT), lon: parseFloat(p.LONG) }));
-    console.log(`[${lineId}] ✅ ${st.route.length} puntos de recorrido`);
-  } catch (e) {
-    st.route = st.stops.map(s => ({ lat: s.lat, lon: s.lon }));
-    console.warn(`[${lineId}] ⚠️  Recorrido fallback a paradas`);
+    st.route = data.resultados.map(p => ({ lat:parseFloat(p.LAT), lon:parseFloat(p.LONG) }));
+    console.log(`[${lineId}] ✅ ${st.route.length} puntos recorrido`);
+  } catch(e) {
+    st.route = st.stops.map(s => ({ lat:s.lat, lon:s.lon }));
   }
 }
 
-// ─── Fetch posición de un servicio concreto ────────────────────────────────────
+// ─── Fetch posición de un servicio ────────────────────────────────────────────
 async function fetchPosition(codEnruta, codReiteracion) {
   try {
-    const data = await apiFetch({ OP: 'VEHICULO_POSICION_GET', COD_ENRUTA: codEnruta, COD_SERV_REITERACION: codReiteracion });
+    const data = await apiFetch({ OP:'VEHICULO_POSICION_GET', COD_ENRUTA:codEnruta, COD_SERV_REITERACION:codReiteracion });
     if (data.estado !== 'ok' || !data.resultado) return null;
     const lat = parseFloat(data.resultado.LAT);
     const lon = parseFloat(data.resultado.LON);
-    if (isNaN(lat) || isNaN(lon)) return null;
-    if (lat < 35 || lat > 39 || lon < -7 || lon > -3) return null;
-    return { lat, lon, vehicleId: data.resultado.COD_VEHICULO, fechaHora: data.resultado.FECHA_HORA };
+    if (isNaN(lat)||isNaN(lon)||lat<35||lat>39||lon<-7||lon>-3) return null;
+    return { lat, lon, vehicleId:data.resultado.COD_VEHICULO, fechaHora:data.resultado.FECHA_HORA };
   } catch { return null; }
 }
 
-// ─── Descubrir servicio activo para una línea ─────────────────────────────────
-// Prueba todos los servicios de hoy en paralelo (batches de 10)
-async function discoverActive(lineId) {
+// ─── Descubrir servicio activo (separado por dirección) ───────────────────────
+async function discoverActiveByDir(lineId, dir) {
   const st = lineStates[lineId];
-  if (!st.services.length) return null;
-
-  // Filtrar servicios del día actual
   const days = ['domingo','lunes','martes','miercoles','jueves','viernes','sabado'];
   const today = days[new Date().getDay()];
-  const todayServices = st.services.filter(s => s[today] === 1);
-  const toCheck = todayServices.length ? todayServices : st.services;
 
-  // Probar en batches de 10
-  for (let i = 0; i < toCheck.length; i += 10) {
-    const batch = toCheck.slice(i, i + 10);
+  // Filtrar servicios de la dirección correcta y del día actual
+  const candidates = st.services.filter(s =>
+    s.direction.dir === dir && (s[today] === 1)
+  );
+
+  for (let i = 0; i < candidates.length; i += 8) {
+    const batch = candidates.slice(i, i+8);
     const results = await Promise.all(
-      batch.map(s => fetchPosition(st.def.codEnruta, s.cod).then(pos => pos ? s : null).catch(() => null))
+      batch.map(s => fetchPosition(st.def.codEnruta, s.cod)
+        .then(pos => pos ? { ...s, pos } : null).catch(() => null))
     );
     const found = results.find(r => r !== null);
     if (found) {
-      console.log(`[${lineId}] ✅ Servicio activo: ${found.cod} (${found.hora} ${found.descripcion.split('(')[0].trim()})`);
+      console.log(`[${lineId}/${dir}] ✅ Activo: ${found.hora} ${found.direction.label}`);
       return found;
     }
   }
   return null;
 }
 
-// ─── Kalman filter ────────────────────────────────────────────────────────────
+// ─── Kalman + velocidad ────────────────────────────────────────────────────────
 function smooth(k, lat, lon) {
-  if (!k.lat) { k.lat = lat; k.lon = lon; k.u = 1; return { lat, lon }; }
+  if (!k.lat) { k.lat=lat; k.lon=lon; k.u=1; return {lat,lon}; }
   k.u += 0.00001;
   const g = k.u / (k.u + 0.0001);
-  k.lat += g * (lat - k.lat); k.lon += g * (lon - k.lon); k.u *= (1 - g);
-  return { lat: k.lat, lon: k.lon };
+  k.lat += g*(lat-k.lat); k.lon += g*(lon-k.lon); k.u *= (1-g);
+  return { lat:k.lat, lon:k.lon };
 }
 
 function calcSpeed(h, lat, lon) {
-  const prev = h.lat ? { ...h } : null;
-  h.lat = lat; h.lon = lon; h.ts = Date.now();
+  const prev = h.lat ? {...h} : null;
+  h.lat=lat; h.lon=lon; h.ts=Date.now();
   if (!prev) return 0;
   const { haversineMeters } = require('./eta');
-  const d = haversineMeters(prev.lat, prev.lon, lat, lon);
-  const t = (Date.now() - prev.ts) / 1000;
-  return t > 0 ? Math.round((d / t) * 3.6 * 10) / 10 : 0;
+  const d = haversineMeters(prev.lat,prev.lon,lat,lon);
+  const t = (Date.now()-prev.ts)/1000;
+  return t > 0 ? Math.round((d/t)*3.6*10)/10 : 0;
 }
 
-// ─── Poll una línea ───────────────────────────────────────────────────────────
-async function pollLine(lineId) {
+// ─── Poll una dirección (ida o vuelta) ────────────────────────────────────────
+async function pollDirection(lineId, dir) {
   const st = lineStates[lineId];
 
-  // Si no hay servicio activo, intentar descubrir
-  if (!st.activeService) {
-    st.activeService = await discoverActive(lineId);
-    if (!st.activeService) {
-      markOffline(lineId);
+  if (!st.active[dir]) {
+    st.active[dir] = await discoverActiveByDir(lineId, dir);
+    if (!st.active[dir]) {
+      if (st.vehicles[dir]?.isOnline !== false) {
+        st.vehicles[dir] = { ...(st.vehicles[dir]||{}), lineId, dir, isOnline:false, updatedAt:new Date().toISOString() };
+        notify({ type:'vehicle:offline', data:{ lineId, dir } });
+      }
       return;
     }
   }
 
-  // Fetch posición
-  const pos = await fetchPosition(st.def.codEnruta, st.activeService.cod);
+  const pos = await fetchPosition(st.def.codEnruta, st.active[dir].cod);
   if (!pos) {
-    console.log(`[${lineId}] ⚠️  Servicio ${st.activeService.cod} sin respuesta, re-descubriendo...`);
-    st.activeService = null;
-    markOffline(lineId);
+    st.active[dir] = null;
+    st.vehicles[dir] = { ...(st.vehicles[dir]||{}), lineId, dir, isOnline:false, updatedAt:new Date().toISOString() };
+    notify({ type:'vehicle:offline', data:{ lineId, dir } });
     return;
   }
 
-  const s  = smooth(st.kalman, pos.lat, pos.lon);
-  const sp = calcSpeed(st.history, s.lat, s.lon);
-  const etas = st.stops.length ? calculateETAs(s.lat, s.lon, sp, st.stops, lineId) : [];
+  const s   = smooth(st.kalman[dir], pos.lat, pos.lon);
+  const sp  = calcSpeed(st.history[dir], s.lat, s.lon);
+  const etas = st.stops.length ? calculateETAs(s.lat, s.lon, sp, st.stops, lineId+':'+dir) : [];
+  const direction = st.active[dir].direction;
 
-  st.vehicle = {
+  st.vehicles[dir] = {
     lineId,
+    dir,
     lineName:    st.def.name,
     lineColor:   st.def.color,
     lat:         s.lat,
     lon:         s.lon,
     speedKmh:    sp,
     vehicleId:   pos.vehicleId,
-    service:     st.activeService.hora,
-    direction:   st.activeService.descripcion,
+    service:     st.active[dir].hora,
+    direction,
     fetchedAt:   pos.fechaHora,
     updatedAt:   new Date().toISOString(),
     isOnline:    true,
     etas,
   };
 
-  notify({ type: 'vehicle:position', data: st.vehicle });
-  console.log(`[${lineId}] ✅ lat=${s.lat.toFixed(5)} lon=${s.lon.toFixed(5)} ${sp}km/h`);
+  // Notificar con id único por dirección
+  notify({ type:'vehicle:position', data:{ ...st.vehicles[dir], lineId: lineId + (dir==='vuelta'?'_V':'') }});
+  console.log(`[${lineId}/${dir}] ${s.lat.toFixed(5)},${s.lon.toFixed(5)} ${sp}km/h ${direction.label}`);
 }
 
-function markOffline(lineId) {
-  const st = lineStates[lineId];
-  if (st.vehicle?.isOnline !== false) {
-    st.vehicle = { ...(st.vehicle || {}), lineId, isOnline: false, updatedAt: new Date().toISOString() };
-    notify({ type: 'vehicle:offline', data: { lineId } });
-    console.log(`[${lineId}] 🔴 Sin servicio activo`);
-  }
+// ─── Poll completo de una línea (ambas direcciones) ────────────────────────────
+async function pollLine(lineId) {
+  await Promise.all([
+    pollDirection(lineId, 'ida'),
+    pollDirection(lineId, 'vuelta'),
+  ]);
 }
 
-function notify(msg) {
-  const json = JSON.stringify(msg);
-  listeners.forEach(cb => { try { cb(json); } catch {} });
-}
-
-// ─── Arrancar ─────────────────────────────────────────────────────────────────
+// ─── Arrancar ──────────────────────────────────────────────────────────────────
 async function startPolling() {
-  console.log('🚌 Iniciando AVO Backend v3 — Multi-línea');
-
-  // Cargar datos de todas las líneas en paralelo
+  console.log('🚌 AVO Backend v5 — IDA + VUELTA simultáneos');
   await Promise.all(LINE_DEFS.map(async l => {
-    console.log(`\n📋 Cargando ${l.lineId}...`);
     await loadServices(l.lineId);
     await loadStops(l.lineId);
     await loadRoute(l.lineId);
   }));
 
-  console.log('\n🚌 Iniciando polling de todas las líneas...');
-
-  // Poll todas las líneas
   async function pollAll() {
-    await Promise.all(LINE_DEFS.map(l => pollLine(l.lineId).catch(e => console.error(`[${l.lineId}] Error:`, e.message))));
+    await Promise.all(LINE_DEFS.map(l => pollLine(l.lineId).catch(e => console.error(`[${l.lineId}]`, e.message))));
   }
 
   await pollAll();
   setInterval(pollAll, POLL_MS);
-
-  // Recargar servicios cada 30 min (por si cambian)
   setInterval(() => {
     LINE_DEFS.forEach(l => {
-      lineStates[l.lineId].activeService = null;
+      lineStates[l.lineId].active = { ida:null, vuelta:null };
       loadServices(l.lineId);
     });
-  }, 30 * 60 * 1000);
+  }, 30*60*1000);
 }
 
-// ─── Exports ──────────────────────────────────────────────────────────────────
+function notify(msg) {
+  const json = JSON.stringify(msg);
+  listeners.forEach(cb => { try{ cb(json); }catch{} });
+}
+
+// ─── Exports ───────────────────────────────────────────────────────────────────
 module.exports = {
   startPolling,
   addListener:    cb => listeners.add(cb),
   removeListener: cb => listeners.delete(cb),
 
+  // Devuelve todos los vehículos activos (ida + vuelta de cada línea)
   getVehicleState: () => {
     const result = {};
-    LINE_DEFS.forEach(l => { if (lineStates[l.lineId].vehicle) result[l.lineId] = lineStates[l.lineId].vehicle; });
+    LINE_DEFS.forEach(l => {
+      const st = lineStates[l.lineId];
+      // Vehicle principal (ida si existe, si no vuelta)
+      const main = st.vehicles.ida || st.vehicles.vuelta;
+      if (main) result[l.lineId] = main;
+      // Vuelta como línea separada si ambas están activas
+      if (st.vehicles.ida && st.vehicles.vuelta) {
+        result[l.lineId + '_V'] = st.vehicles.vuelta;
+      }
+    });
     return result;
   },
 
-  getLineStops: (lineId) => lineStates[lineId]?.stops || [],
-
-  getLineRoute: (lineId) => lineStates[lineId]?.route || [],
-
-  getLines: () => LINE_DEFS.map(l => ({
-    lineId:    l.lineId,
-    name:      l.name,
-    shortName: l.shortName,
-    color:     l.color,
-    stops:     lineStates[l.lineId].stops,
-    route:     lineStates[l.lineId].route,
-    services:  lineStates[l.lineId].services,
-    vehicle:   lineStates[l.lineId].vehicle,
-  })),
-
-  getLine: (lineId) => {
-    const l = LINE_DEFS.find(x => x.lineId === lineId);
-    if (!l) return null;
+  // Para el endpoint /vehicles/:lineId devolver ambos si están activos
+  getVehiclesByLine: (lineId) => {
     const st = lineStates[lineId];
-    return { ...l, stops: st.stops, route: st.route, services: st.services, vehicle: st.vehicle };
+    if (!st) return [];
+    return [st.vehicles.ida, st.vehicles.vuelta].filter(Boolean);
   },
+
+  getLineStops:  lineId => lineStates[lineId]?.stops  || [],
+  getLineRoute:  lineId => lineStates[lineId]?.route  || [],
+  getLines: () => LINE_DEFS.map(l => ({
+    lineId:l.lineId, name:l.name, color:l.color,
+    stops:lineStates[l.lineId].stops,
+    route:lineStates[l.lineId].route,
+    services:lineStates[l.lineId].services,
+    vehicles:lineStates[l.lineId].vehicles,
+  })),
 };
 
-// ─── Dead-reckoning: extrapola la posición del bus cuando el GPS no actualiza ──
-// Si el GPS del bus no ha enviado posición en los últimos N segundos,
-// proyectamos dónde debería estar ahora mismo usando velocidad + rumbo.
-// Esto elimina el "lag" visual en el mapa.
-
+// ─── Dead-reckoning ────────────────────────────────────────────────────────────
 function extrapolatePosition(vehicle, stops) {
-  if (!vehicle || !vehicle.lat || !vehicle.lon) return vehicle;
-
-  const now        = Date.now();
-  const updatedMs  = new Date(vehicle.updatedAt).getTime();
-  const lagSeconds = (now - updatedMs) / 1000;
-
-  // Solo extrapolar si el lag es entre 5 y 120 segundos
-  // (menos: no merece la pena; más: GPS puede estar offline)
-  if (lagSeconds < 5 || lagSeconds > 120 || !vehicle.speedKmh || vehicle.speedKmh < 5) {
-    return vehicle;
-  }
-
-  // Cuántos metros debería haber avanzado el bus
-  const distExtraM = (vehicle.speedKmh / 3.6) * lagSeconds;
-
-  // Encontrar la parada "next" y la siguiente para interpolar a lo largo de la ruta
-  const etas      = vehicle.etas || [];
-  const nextStop  = etas.find(e => e.status === 'next');
-  const upcoming  = etas.filter(e => e.status === 'upcoming');
-
+  if (!vehicle?.lat || !vehicle?.lon) return vehicle;
+  const lagSeconds = (Date.now() - new Date(vehicle.updatedAt).getTime()) / 1000;
+  if (lagSeconds < 5 || lagSeconds > 120 || !vehicle.speedKmh || vehicle.speedKmh < 5) return vehicle;
+  const distExtraM = (vehicle.speedKmh/3.6) * lagSeconds;
+  const nextStop = (vehicle.etas||[]).find(e=>e.status==='next');
   if (!nextStop) return vehicle;
-
   const { haversineMeters } = require('./eta');
-  const distToNext = haversineMeters(vehicle.lat, vehicle.lon, nextStop.lat, nextStop.lon);
-
-  let extraLat = vehicle.lat;
-  let extraLon = vehicle.lon;
-
+  const distToNext = haversineMeters(vehicle.lat,vehicle.lon,nextStop.lat,nextStop.lon);
+  let extraLat=vehicle.lat, extraLon=vehicle.lon;
   if (distExtraM < distToNext) {
-    // El bus sigue entre su posición GPS y la próxima parada
-    const frac = distExtraM / distToNext;
-    extraLat = vehicle.lat + frac * (nextStop.lat - vehicle.lat);
-    extraLon = vehicle.lon + frac * (nextStop.lon - vehicle.lon);
+    const frac = distExtraM/distToNext;
+    extraLat = vehicle.lat + frac*(nextStop.lat-vehicle.lat);
+    extraLon = vehicle.lon + frac*(nextStop.lon-vehicle.lon);
   } else {
-    // El bus ha superado la próxima parada — usar la siguiente como destino
-    const nextNext = upcoming[0];
-    if (nextNext) {
-      const distRemaining = distExtraM - distToNext;
-      const seg = haversineMeters(nextStop.lat, nextStop.lon, nextNext.lat, nextNext.lon);
-      const frac = Math.min(1, distRemaining / seg);
-      extraLat = nextStop.lat + frac * (nextNext.lat - nextStop.lat);
-      extraLon = nextStop.lon + frac * (nextNext.lon - nextStop.lon);
-    } else {
-      extraLat = nextStop.lat;
-      extraLon = nextStop.lon;
+    const nn = (vehicle.etas||[]).filter(e=>e.status==='upcoming')[0];
+    if (nn) {
+      const seg = haversineMeters(nextStop.lat,nextStop.lon,nn.lat,nn.lon);
+      const frac = Math.min(1,(distExtraM-distToNext)/seg);
+      extraLat = nextStop.lat+frac*(nn.lat-nextStop.lat);
+      extraLon = nextStop.lon+frac*(nn.lon-nextStop.lon);
     }
   }
-
-  return { ...vehicle, lat: extraLat, lon: extraLon, _extrapolated: true, _lagSeconds: Math.round(lagSeconds) };
+  return { ...vehicle, lat:extraLat, lon:extraLon, _extrapolated:true, _lagSeconds:Math.round(lagSeconds) };
 }
-
 module.exports.extrapolatePosition = extrapolatePosition;
