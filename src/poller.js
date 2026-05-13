@@ -59,66 +59,20 @@ function parseDirection(descripcion, color) {
 // ─── Cargar servicios ──────────────────────────────────────────────────────────
 async function loadServices(lineId) {
   const st = lineStates[lineId];
-  // Hardcoded service IDs from RUTAS_GET (verified 2026-05-12)
-  const HARDCODED = {
-    M135: [
-      {cod:555613,hora:'06:00',dir:'ida'}, {cod:555580,hora:'07:00',dir:'ida'},
-      {cod:555631,hora:'07:45',dir:'ida'}, {cod:555579,hora:'08:30',dir:'ida'},
-      {cod:555622,hora:'09:15',dir:'ida'}, {cod:555578,hora:'10:00',dir:'ida'},
-      {cod:555623,hora:'10:45',dir:'ida'}, {cod:555581,hora:'11:30',dir:'ida'},
-      {cod:555624,hora:'12:15',dir:'ida'}, {cod:555583,hora:'13:00',dir:'ida'},
-      {cod:555625,hora:'13:45',dir:'ida'}, {cod:555585,hora:'14:30',dir:'ida'},
-      {cod:555626,hora:'15:15',dir:'ida'}, {cod:555587,hora:'16:00',dir:'ida'},
-      {cod:555627,hora:'16:45',dir:'ida'}, {cod:555590,hora:'17:30',dir:'ida'},
-      {cod:555628,hora:'18:15',dir:'ida'}, {cod:555592,hora:'19:00',dir:'ida'},
-      {cod:555629,hora:'19:45',dir:'ida'}, {cod:555594,hora:'20:30',dir:'ida'},
-      {cod:555630,hora:'21:15',dir:'ida'},
-      {cod:555576,hora:'07:00',dir:'vuelta'}, {cod:555611,hora:'07:45',dir:'vuelta'},
-      {cod:555575,hora:'08:30',dir:'vuelta'}, {cod:555612,hora:'09:15',dir:'vuelta'},
-      {cod:555577,hora:'10:00',dir:'vuelta'}, {cod:555614,hora:'10:45',dir:'vuelta'},
-      {cod:555582,hora:'11:30',dir:'vuelta'}, {cod:555615,hora:'12:15',dir:'vuelta'},
-      {cod:555584,hora:'13:00',dir:'vuelta'}, {cod:555616,hora:'13:45',dir:'vuelta'},
-      {cod:555586,hora:'14:30',dir:'vuelta'}, {cod:555617,hora:'15:15',dir:'vuelta'},
-      {cod:555588,hora:'16:00',dir:'vuelta'}, {cod:555618,hora:'16:45',dir:'vuelta'},
-      {cod:555589,hora:'17:30',dir:'vuelta'}, {cod:555619,hora:'18:15',dir:'vuelta'},
-      {cod:555591,hora:'19:00',dir:'vuelta'}, {cod:555620,hora:'19:45',dir:'vuelta'},
-      {cod:555593,hora:'20:30',dir:'vuelta'}, {cod:555621,hora:'21:15',dir:'vuelta'},
-      {cod:555595,hora:'22:00',dir:'vuelta'},
-    ]
-  };
-  if (HARDCODED[lineId]) {
-    st.services = HARDCODED[lineId].map(s => ({
-      cod: s.cod, hora: s.hora,
-      direction: s.dir === 'ida'
-        ? {dir:'ida', label:'→ Málaga', short:'ida'}
-        : {dir:'vuelta', label:'→ Alhaurín de la Torre', short:'vuelta'},
-      lunes:1, martes:1, miercoles:1, jueves:1, viernes:1, sabado:1, domingo:0,
-    }));
-    const ida = st.services.filter(s=>s.direction.dir==='ida').length;
-    const vuelta = st.services.filter(s=>s.direction.dir==='vuelta').length;
-    console.log('[' + lineId + '] ✅ ' + st.services.length + ' servicios hardcoded (' + ida + ' ida, ' + vuelta + ' vuelta)');
-    return;
-  }
-  // Fallback: fetch from API for other lines
   try {
     const data = await apiFetch({ OP:'RUTAS_GET', COD_ENRUTA:st.def.codEnruta });
     if (data.estado !== 'ok' || !data.resultados?.length) throw new Error('Sin servicios');
     st.services = data.resultados.map(r => ({
-      cod:       r.COD_SERV_REITERACION,
-      codRuta:   r.COD_SERV_RUTA,
-      hora:      r.HORA_SALIDA,
-      desc:      r.DESCRIPCION,
-      color:     r.COLOR,
+      cod: r.COD_SERV_REITERACION, codRuta: r.COD_SERV_RUTA,
+      hora: r.HORA_SALIDA, desc: r.DESCRIPCION, color: r.COLOR,
       direction: parseDirection(r.DESCRIPCION, r.COLOR),
       lunes:r.LUNES, martes:r.MARTES, miercoles:r.MIERCOLES,
       jueves:r.JUEVES, viernes:r.VIERNES, sabado:r.SABADO, domingo:r.DOMINGO,
     }));
-    const ida    = st.services.filter(s => s.direction.dir === 'ida').length;
-    const vuelta = st.services.filter(s => s.direction.dir === 'vuelta').length;
-    console.log('[' + lineId + '] ✅ ' + st.services.length + ' servicios (' + ida + ' ida, ' + vuelta + ' vuelta)');
-  } catch(e) {
-    console.warn('[' + lineId + '] ⚠️  servicios: ' + e.message);
-  }
+    const ida = st.services.filter(s=>s.direction.dir==='ida').length;
+    const vuelta = st.services.filter(s=>s.direction.dir==='vuelta').length;
+    console.log("["+lineId+"] "+st.services.length+" servicios ("+ida+" ida, "+vuelta+" vuelta)");
+  } catch(e) { console.warn("["+lineId+"] loadServices: "+e.message); }
 }
 
 // ─── Cargar paradas y recorrido ────────────────────────────────────────────────
